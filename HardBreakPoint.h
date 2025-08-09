@@ -1,322 +1,250 @@
 #pragma once
 #include <Windows.h>
 #include <TlHelp32.h>
-#include "phmap.h"
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 #include <vector>
+#include <memory>
+#include <bitset>
+
 class HardBreakPoint {
 public:
-	struct BreakPoint {
-		int id;
-		void* original;
-		void* replacement;
-	};
+    struct BreakPoint {
+        int id;
+        void* original;
+        void* replacement;
+    };
 
-	struct DR7 {
-		unsigned int L0 : 1;     // 局部断点0
-		unsigned int G0 : 1;     // 全局断点0
-		unsigned int L1 : 1;     // 局部断点1
-		unsigned int G1 : 1;     // 全局断点1
-		unsigned int L2 : 1;     // 局部断点2
-		unsigned int G2 : 1;     // 全局断点2
-		unsigned int L3 : 1;     // 局部断点3
-		unsigned int G3 : 1;     // 全局断点3
-		unsigned int LE : 1;     // 局部精确断点
-		unsigned int GE : 1;     // 全局精确断点
-		unsigned int reserved1 : 1; // 保留位
-		unsigned int reserved2 : 1; // 保留位
-		unsigned int reserved3 : 1; // 保留位
-		unsigned int GD : 1;
-		unsigned int reserved4 : 2; // 保留位
-		unsigned int RW0 : 2;    // 断点条件0
-		unsigned int LEN0 : 2;   // 断点长度0
-		unsigned int RW1 : 2;    // 断点条件1
-		unsigned int LEN1 : 2;   // 断点长度1
-		unsigned int RW2 : 2;    // 断点条件2
-		unsigned int LEN2 : 2;   // 断点长度2
-		unsigned int RW3 : 2;    // 断点条件3
-		unsigned int LEN3 : 2;   // 断点长度3
+    struct DR7 {
+        uint32_t raw = 0;
 
-		static uint32_t DR7ToDWORD(const DR7& dr7) {
-			uint32_t value = 0;
-			value |= dr7.L0 << 0;
-			value |= dr7.G0 << 1;
-			value |= dr7.L1 << 2;
-			value |= dr7.G1 << 3;
-			value |= dr7.L2 << 4;
-			value |= dr7.G2 << 5;
-			value |= dr7.L3 << 6;
-			value |= dr7.G3 << 7;
-			value |= dr7.LE << 8;
-			value |= dr7.GE << 9;
-			value |= dr7.reserved1 << 10;
-			value |= dr7.reserved2 << 11;
-			value |= dr7.reserved3 << 12;
-			value |= dr7.GD << 13;
-			value |= dr7.reserved4 << 14;
-			value |= dr7.RW0 << 16;
-			value |= dr7.LEN0 << 18;
-			value |= dr7.RW1 << 20;
-			value |= dr7.LEN1 << 22;
-			value |= dr7.RW2 << 24;
-			value |= dr7.LEN2 << 26;
-			value |= dr7.RW3 << 28;
-			value |= dr7.LEN3 << 30;
-			return value;
-		}
-	};
+        auto set(const int _id, void* _address) -> void {
+            raw |= (1 << (_id * 2));
+            raw |= (0b00 << (16 + _id * 4));
+            raw |= (0b00 << (18 + _id * 4));
+        }
 
-	HardBreakPoint() = delete;
+        auto clear(const int _id) -> void {
+            raw &= ~(1 << (_id * 2));
+            raw &= ~(0b11 << (16 + _id * 4));
+            raw &= ~(0b11 << (18 + _id * 4));
+        }
+    };
 
-	static void Initialize() {
-		AddVectoredExceptionHandler(999999, VectoredExceptionHandler);
-	}
+    static auto initialize() -> void {
+        AddVectoredExceptionHandler(1, VectoredExceptionHandler);
+    }
 
-	template<typename R, typename... Args>
-	static bool SetBreakPoint(R(*address)(Args...), R(*replacement)(Args...)) {
-		BreakPoint bp;
-		bp.original = address;
-		bp.replacement = replacement;
-		for (int i = 0; i < 4; i++) {
-			if (!bp_status[i]) {
-				bp.id = i;
-				breakpoints.insert({ address, bp });
-				bp_status[i] = true;
+    template<typename R, typename... Args>
+    static auto set_break_point(R (*_target)(Args...), R (*_replacement)(Args...)) -> bool {
+        std::unique_lock lock(mutex_);
 
-				DWORD myId = GetCurrentThreadId();
-				auto threads = GetProcessThreads(GetCurrentProcessId());
+        for (int i = 0; i < 4; ++i) {
+            if (!bp_status_[i]) {
+                bp_status_[i] = true;
 
-				for (auto thread : threads) {
-					if (thread != myId) {
-						HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, thread);
-						if (hThread == nullptr) {
-							continue;
-						}
-						SuspendThread(hThread);
+                BreakPoint bp{i, reinterpret_cast<void*>(_target), reinterpret_cast<void*>(_replacement)};
+                breakpoints_[_target] = bp;
+                reverse_map_[_replacement] = _target;
+                dr7_.set(i, reinterpret_cast<void*>(_target));
 
-						if (breakpoints.size() <= 4) {
+                apply_to_all_threads([&](const HANDLE _thread) {
+                    apply_break_point_to_thread(_thread, bp);
+                });
 
+                return true;
+            }
+        }
+        return false;
+    }
 
-							CONTEXT ctx = {};
-							ctx.ContextFlags = CONTEXT_ALL;
-							if (!GetThreadContext(hThread, &ctx)) {
-								ResumeThread(hThread);
-								CloseHandle(hThread);
-								continue;
-							}
+    template<typename R, typename... Args>
+    static auto remove_break_point(R (*_target)(Args...)) -> bool {
+        std::unique_lock lock(mutex_);
 
+        auto it = breakpoints_.find(_target);
+        if (it == breakpoints_.end()) {
+            return false;
+        }
 
-							switch (i) {
-							case 0:
-								ctx.Dr0 = reinterpret_cast<DWORD_PTR>(address);
-								dr7.L0 = 1;
-								dr7.RW0 = 0;
-								break;
-							case 1:
-								ctx.Dr1 = reinterpret_cast<DWORD_PTR>(address);
-								dr7.L1 = 1;
-								dr7.RW1 = 0;
-								break;
-							case 2:
-								ctx.Dr2 = reinterpret_cast<DWORD_PTR>(address);
-								dr7.L2 = 1;
-								dr7.RW2 = 0;
-								break;
-							case 3:
-								ctx.Dr3 = reinterpret_cast<DWORD_PTR>(address);
-								dr7.L3 = 1;
-								dr7.RW3 = 0;
-								break;
-							}
-							ctx.Dr7 = DR7::DR7ToDWORD(dr7);
-							ctx.ContextFlags = CONTEXT_ALL;
-							SetThreadContext(hThread, &ctx);
-						}
+        const BreakPoint& bp = it->second;
+        bp_status_[bp.id] = false;
+        dr7_.clear(bp.id);
+        reverse_map_.erase(bp.replacement);
+        breakpoints_.erase(it);
 
-						ResumeThread(hThread);
-						CloseHandle(hThread);
-					}
-				}
-				break;
-			}
-		}
-		return true;
-	}
+        apply_to_all_threads([&](const HANDLE _thread) {
+            remove_break_point_from_thread(_thread, bp);
+        });
 
-	template<typename R, typename... Args>
-	static bool RemoveBreakPoint(R(*address)(Args...)) {
-		BreakPoint bp = breakpoints[address];
-		DWORD myId = GetCurrentThreadId();
-		auto threads = GetProcessThreads(GetCurrentProcessId());
+        return true;
+    }
 
-		for (auto thread : threads) {
-			if (thread != myId) {
-				HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, thread);
-				if (hThread == nullptr) {
-					continue;
-				}
-				SuspendThread(hThread);
+    template<typename R, typename... Args>
+    static auto call_origin(R (*_replacement)(Args...), Args... _args) -> R {
+        std::shared_lock lock(mutex_);
 
-				CONTEXT ctx = {};
-				ctx.ContextFlags = CONTEXT_ALL;
-				if (GetThreadContext(hThread, &ctx)) {
-					switch (bp.id) {
-						case 0: ctx.Dr0 = 0; break;
-						case 1: ctx.Dr1 = 0; break;
-						case 2: ctx.Dr2 = 0; break;
-						case 3: ctx.Dr3 = 0; break;
-					}
-					ctx.Dr7 = DR7::DR7ToDWORD(dr7);
-					ctx.ContextFlags = CONTEXT_ALL;
-					SetThreadContext(hThread, &ctx);
-				}
+        auto orig = reverse_map_[_replacement];
+        const auto& bp = breakpoints_[orig];
 
-				ResumeThread(hThread);
-				CloseHandle(hThread);
-			}
-		}
+        HANDLE h_thread = GetCurrentThread();
+        remove_break_point_from_thread(h_thread, bp);
 
-		bp_status[bp.id] = false;
-	   	breakpoints.erase(address);
-		return true;
-	}
+        if constexpr (std::is_void_v<R>) {
+            reinterpret_cast<R(*)(Args...)>(bp.original)(_args...);
+        } else {
+            R ret = reinterpret_cast<R(*)(Args...)>(bp.original)(_args...);
+            apply_break_point_to_thread(h_thread, bp);
+            return ret;
+        }
 
-	template<typename R, typename... Args>
-	static R CallOrigin(R(*func)(Args...), Args... args) {
-		for (auto [fst, snd] : breakpoints) {
-			if (snd.replacement == func) {
-				R(*originalFunc)(Args...) = reinterpret_cast<R(*)(Args...)>(snd.original);
-				R(*replacementFunc)(Args...) = reinterpret_cast<R(*)(Args...)>(snd.replacement);
-				if constexpr (std::is_void_v<R>) {
-					RemoveBreakPointThread(GetCurrentThread(), originalFunc);
-					originalFunc(args...);
-					SetBreakPointThread(GetCurrentThread(), originalFunc, replacementFunc);
-					return;
-				} else {
-					RemoveBreakPointThread(GetCurrentThread(), originalFunc);
-					R ret = originalFunc(args...);
-					SetBreakPointThread(GetCurrentThread(), originalFunc, replacementFunc);
-					return ret;
-				}
-			}
-		}
-		return R();
-	}
+        apply_break_point_to_thread(h_thread, bp);
+        return R();
+    }
 
-	inline static DR7 dr7;
+    inline static DR7 dr7_;
 private:
-	inline static bool bp_status[] = {false, false, false, false};
-	inline static inline phmap::parallel_flat_hash_map<void*, BreakPoint, phmap::priv::hash_default_hash<void*>, phmap::priv::hash_default_eq<void*>, phmap::priv::Allocator<std::pair<void*, BreakPoint>>, 4, std::mutex> breakpoints;
+    inline static std::bitset<4> bp_status_;
+    inline static std::shared_mutex mutex_;
+    inline static phmap::parallel_flat_hash_map<void*, BreakPoint, phmap::priv::hash_default_hash<void*>, phmap::priv::hash_default_eq<void*>, mi_stl_allocator<std::pair<void*, BreakPoint>>, 4,
+                                                std::shared_mutex> breakpoints_;
+    inline static phmap::parallel_flat_hash_map<void*, void*, phmap::priv::hash_default_hash<void*>, phmap::priv::hash_default_eq<void*>, mi_stl_allocator<std::pair<void*, void*>>, 4,
+                                                std::shared_mutex> reverse_map_;
 
+    class ThreadHandle {
+    public:
+        explicit ThreadHandle(const DWORD _tid) {
+            h_thread_ = OpenThread(THREAD_ALL_ACCESS, FALSE, _tid);
+        }
 
-	template<typename R, typename... Args>
-	static bool RemoveBreakPointThread(HANDLE hThread, R(*address)(Args...)) {
-		BreakPoint bp = breakpoints[address];
-		CONTEXT ctx = {};
-		ctx.ContextFlags = CONTEXT_ALL;
-		if (GetThreadContext(hThread, &ctx)) {
-			switch (bp.id) {
-				case 0: ctx.Dr0 = 0; break;
-				case 1: ctx.Dr1 = 0; break;
-				case 2: ctx.Dr2 = 0; break;
-				case 3: ctx.Dr3 = 0; break;
-			}
-			ctx.Dr7 = DR7::DR7ToDWORD(dr7);
-			ctx.ContextFlags = CONTEXT_ALL;
-			SetThreadContext(hThread, &ctx);
-			bp_status[bp.id] = false;
-			breakpoints.erase(address);
-			return true;
-		}
-		return false;
-	}
+        ~ThreadHandle() {
+            if (h_thread_) {
+                CloseHandle(h_thread_);
+            }
+        }
 
-	template<typename R, typename... Args>
-	static bool SetBreakPointThread(HANDLE hThread, R(*address)(Args...), R(*replacement)(Args...)) {
-		if (breakpoints.size() < 4) {
-			BreakPoint bp;
-			bp.original = address;
-			bp.replacement = replacement;
+        auto valid() const -> bool {
+            return h_thread_ != nullptr;
+        }
 
-			CONTEXT ctx = {};
-			ctx.ContextFlags = CONTEXT_ALL;
-			GetThreadContext(hThread, &ctx);
+        auto get() const -> HANDLE {
+            return h_thread_;
+        }
 
-			for (int i = 0; i < 4; i++) {
-				if (!bp_status[i]) {
-					bp.id = i;
-					breakpoints.insert({ address, bp });
-					bp_status[i] = true;
+        auto suspend_resume(const std::function<void()>& _action) const -> void {
+            if (!valid()) {
+                return;
+            }
+            SuspendThread(h_thread_);
+            _action();
+            ResumeThread(h_thread_);
+        }
 
-					switch (i) {
-					case 0:
-						ctx.Dr0 = reinterpret_cast<DWORD_PTR>(address);
-						dr7.L0 = 1;
-						dr7.RW0 = 0;
-						break;
-					case 1:
-						ctx.Dr1 = reinterpret_cast<DWORD_PTR>(address);
-						dr7.L1 = 1;
-						dr7.RW1 = 0;
-						break;
-					case 2:
-						ctx.Dr2 = reinterpret_cast<DWORD_PTR>(address);
-						dr7.L2 = 1;
-						dr7.RW2 = 0;
-						break;
-					case 3:
-						ctx.Dr3 = reinterpret_cast<DWORD_PTR>(address);
-						dr7.L3 = 1;
-						dr7.RW3 = 0;
-						break;
-					}
-					ctx.Dr7 = DR7::DR7ToDWORD(dr7);
-					ctx.ContextFlags = CONTEXT_ALL;
-					SetThreadContext(hThread, &ctx);
-					break;
-				}
-			}
-		}
-		return false;
-	}
+    private:
+        HANDLE h_thread_;
+    };
 
-	static std::vector<DWORD> GetProcessThreads(DWORD processID) {
-		std::vector<DWORD> threadIDs;
-		HANDLE hThreadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-		if (hThreadSnap == INVALID_HANDLE_VALUE) {
-			return threadIDs;
-		}
+    static auto apply_to_all_threads(const std::function<void(HANDLE)>& _func) -> void {
+        const DWORD self = GetCurrentThreadId();
+        for (const DWORD tid : get_all_thread_ids()) {
+            if (tid == self) {
+                continue;
+            }
+            ThreadHandle th(tid);
+            if (th.valid()) {
+                th.suspend_resume([&]() {
+                    _func(th.get());
+                });
+            }
+        }
+    }
 
-		THREADENTRY32 te32;
-		te32.dwSize = sizeof(THREADENTRY32);
+    static auto get_all_thread_ids() -> std::vector<DWORD> {
+        std::vector<DWORD> ids;
+        const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) {
+            return ids;
+        }
 
-		if (Thread32First(hThreadSnap, &te32)) {
-			do {
-				if (te32.th32OwnerProcessID == processID) {
-					threadIDs.push_back(te32.th32ThreadID);
-				}
-			} while (Thread32Next(hThreadSnap, &te32));
-		}
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        if (Thread32First(snapshot, &te)) {
+            do {
+                if (te.th32OwnerProcessID == GetCurrentProcessId()) {
+                    ids.push_back(te.th32ThreadID);
+                }
+            } while (Thread32Next(snapshot, &te));
+        }
+        CloseHandle(snapshot);
+        return ids;
+    }
 
-		CloseHandle(hThreadSnap);
-		return threadIDs;
-	}
+    static auto apply_break_point_to_thread(const HANDLE _thread, const BreakPoint& _bp) -> void {
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!GetThreadContext(_thread, &ctx)) {
+            return;
+        }
 
-	static auto WINAPI VectoredExceptionHandler(PEXCEPTION_POINTERS exception) -> LONG {
-		if (exception->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        switch (_bp.id) {
+            case 0:
+                ctx.Dr0 = reinterpret_cast<DWORD_PTR>(_bp.original);
+                break;
+            case 1:
+                ctx.Dr1 = reinterpret_cast<DWORD_PTR>(_bp.original);
+                break;
+            case 2:
+                ctx.Dr2 = reinterpret_cast<DWORD_PTR>(_bp.original);
+                break;
+            case 3:
+                ctx.Dr3 = reinterpret_cast<DWORD_PTR>(_bp.original);
+                break;
+            default: ;
+        }
+        ctx.Dr7 = dr7_.raw;
+        SetThreadContext(_thread, &ctx);
+    }
+
+    static auto remove_break_point_from_thread(const HANDLE _thread, const BreakPoint& _bp) -> void {
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!GetThreadContext(_thread, &ctx)) {
+            return;
+        }
+
+        switch (_bp.id) {
+            case 0:
+                ctx.Dr0 = 0;
+                break;
+            case 1:
+                ctx.Dr1 = 0;
+                break;
+            case 2:
+                ctx.Dr2 = 0;
+                break;
+            case 3:
+                ctx.Dr3 = 0;
+                break;
+            default: ;
+        }
+        ctx.Dr7 = dr7_.raw;
+        SetThreadContext(_thread, &ctx);
+    }
+
+    static auto WINAPI VectoredExceptionHandler(PEXCEPTION_POINTERS _ep) -> LONG {
+        if (_ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+            std::shared_lock lock(mutex_);
+            void* addr = _ep->ExceptionRecord->ExceptionAddress;
+            auto bp = breakpoints_[addr];
 #ifdef _WIN64
-			if (breakpoints.contains(exception->ExceptionRecord->ExceptionAddress)) {
-				exception->ContextRecord->Dr7 = DR7::DR7ToDWORD(dr7);
-				exception->ContextRecord->Rip = reinterpret_cast<DWORD64>(breakpoints[exception->ExceptionRecord->ExceptionAddress].replacement);
-				return EXCEPTION_CONTINUE_EXECUTION;
-			}
+            ep->ContextRecord->Rip = reinterpret_cast<DWORD64>(bp.replacement);
 #else
-			if (breakpoints.contains(exception->ExceptionRecord->ExceptionAddress)) {
-				exception->ContextRecord->Dr7 = DR7::DR7ToDWORD(dr7);
-				exception->ContextRecord->Eip = reinterpret_cast<DWORD>(breakpoints[exception->ExceptionRecord->ExceptionAddress].replacement);
-				return EXCEPTION_CONTINUE_EXECUTION;
-			}
+            _ep->ContextRecord->Eip = reinterpret_cast<DWORD>(bp.replacement);
 #endif
-		}
-		return EXCEPTION_CONTINUE_SEARCH;
-	}
+            _ep->ContextRecord->Dr7 = dr7_.raw;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
 };
